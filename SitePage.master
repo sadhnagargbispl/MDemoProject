@@ -1,0 +1,194 @@
+﻿<%@ Master Language="C#" AutoEventWireup="true" CodeFile="SitePage.master.cs" Inherits="SitePage" %>
+
+<%@ Register Assembly="AjaxControlToolkit" Namespace="AjaxControlToolkit" TagPrefix="ajaxToolkit" %>
+<%@ Register Src="~/WUCMenu.ascx" TagName="WUCMenu" TagPrefix="uc1" %>
+
+<!DOCTYPE html>
+
+<html>
+<head runat="server">
+    <meta charset="UTF-8">
+    <meta content="width=device-width, initial-scale=1, maximum-scale=1, shrink-to-fit=no" name="viewport">
+    <title><%=Session["Title"].ToString ()%></title>
+    <link rel="stylesheet" href="assets/css/app.min.css?v=1.5">
+    <link rel="stylesheet" href="assets/css/style.css?v=1.5">
+    <link rel="stylesheet" href="assets/css/components.css?v=1.5">
+    <link rel="stylesheet" href="assets/bundles/jqvmap/dist/jqvmap.min.css?v=1.5">
+    <link rel="stylesheet" href="assets/css/custom.css?v=1.5">
+    <script type="text/javascript" src="highslide/highslide-full.js"></script>
+
+    <link rel="stylesheet" type="text/css" href="highslide/highslide.css?v=1.5" />
+    <style type="text/css">
+        .page {
+            margin: 2%;
+        }
+    </style>
+
+    <script type="text/javascript">
+        hs.graphicsDir = 'highslide/graphics/';
+        hs.align = 'center';
+        hs.transitions = ['expand', 'crossfade'];
+        hs.fadeInOut = true;
+        hs.dimmingOpacity = 0.8;
+        hs.outlineType = 'rounded-white';
+        hs.marginTop = 60;
+        hs.marginBottom = 40;
+        hs.numberPosition = '';
+        hs.wrapperClassName = 'custom';
+        hs.width = 600;
+        hs.height = 500;
+        hs.number = 'Page %1 of %2';
+        hs.captionOverlay.fade = 0;
+
+        // Add the slideshow providing the controlbar and the thumbstrip
+
+    </script>
+    <asp:ContentPlaceHolder ID="head" runat="server">
+    </asp:ContentPlaceHolder>
+</head>
+<body>
+    <div class="loader"></div>
+    <form id="form1" runat="server">
+        <asp:ScriptManager ID="ScriptManager1" runat="server"></asp:ScriptManager>
+        <div>
+                    <input type="hidden"
+            id="Isformupload"
+            value="<%= Userkycres != null ? Userkycres.Isformupload : "" %>" />
+
+        <input type="hidden"
+            id="isformuploadvalue"
+            value="<%= (Userkycres != null && Userkycres.formuploaddetail != null)
+? Userkycres.formuploaddetail.formupload
+: "" %>" />
+            <input type="hidden" id="CompID" value="<%= Session["CompID"] %>" />
+            <div id="app">
+                <div class="main-wrapper main-wrapper-1">
+                    <div class="navbar-bg"></div>
+                    <nav class="navbar navbar-expand-lg main-navbar sticky">
+                        <div class="form-inline me-auto">
+                            <ul class="navbar-nav mr-3">
+                                <li>
+                                    <a href="#" data-bs-toggle="sidebar" class="nav-link nav-link-lg collapse-btn"><i data-feather="menu"></i></a>
+                                </li>
+                            </ul>
+                        </div>
+                        <% if (Session["Status"] != null && Session["Status"].ToString() == "OK")
+                            { %>
+                        <ul class="navbar-nav navbar-right">
+                            <li>
+                                <a href="#" class="nav-link nav-link-lg fullscreen-btn">
+                                    <i data-feather="maximize"></i>
+                                </a>
+                            </li>
+
+                            <li class="dropdown">
+                                <a href="#" data-bs-toggle="dropdown" class="nav-link dropdown-toggle nav-link-lg nav-link-user">
+                                    <%--<img alt="image" src="assets/img/user.png" class="user-img-radious-style">--%>
+                                    <asp:Image ID="Image2" runat="server" class="user-img-radious-style" />
+                                    <span class="d-sm-none d-lg-inline-block"></span>
+                                </a>
+                                <div class="dropdown-menu dropdown-menu-right pullDown">
+                                    <div class="dropdown-title">
+                                        Hello,
+                                        <asp:Label ID="LblId" runat="server"></asp:Label>
+                                    </div>
+                                    <%--  <a href="#" class="dropdown-item has-icon"><i class="far fa-user"></i>Profile </a>--%>
+                                    <div class="dropdown-divider"></div>
+                                    <a href="logout.aspx" class="dropdown-item has-icon text-danger"><i class="fas fa-sign-out-alt"></i>Logout </a>
+                                </div>
+                            </li>
+                        </ul>
+                        <% } %>
+                    </nav>
+
+                    <div class="main-sidebar sidebar-style-2">
+                        <aside id="sidebar-wrapper">
+                            <div class="sidebar-brand">
+                                <a href="#" runat="server" id="LOGOHREF">
+                                    <img src="assets/cmplogo.png" runat="server" id="imgLogo" class="header-logo" alt="">
+                                </a>
+                                <%-- <a href="#">
+                                    <img alt="image" src="<%=Session["LogoUrl"].ToString ()%>" class="header-logo" />
+                                </a>--%>
+                            </div>
+                            <% if (Session["Status"] != null && Session["Status"].ToString() == "OK")
+                                { %>
+                            <div class="sidebar-user">
+                                <%-- <div class="sidebar-user-picture">
+                                    <img alt="image" src="assets/img/user.png">
+                                </div>--%>
+                                <div class="sidebar-user-details">
+                                    <div class="user-name">
+                                        <asp:Label ID="LblUSerID" runat="server"></asp:Label>
+                                    </div>
+                                    <div class="user-role">
+                                        <asp:Label ID="LblName" runat="server"></asp:Label>
+                                    </div>
+                                    <div class="user-role">
+                                        <asp:Label ID="datej" runat="server"></asp:Label>
+                                    </div>
+                                </div>
+                            </div>
+                            <% } %>
+
+                            <!-- REPLACED static UL with user control WUCMenu -->
+                            <uc1:WUCMenu ID="WUCMenu1" runat="server" />
+
+                        </aside>
+                    </div>
+
+                    <asp:ContentPlaceHolder ID="ContentPlaceHolder1" runat="server">
+                    </asp:ContentPlaceHolder>
+                </div>
+                <footer class="main-footer">
+                    <div class="footer-left">
+                        Copyright &copy; 2025
+                        <div class="bullet"></div>
+                        Design By <a href="#"><%=Session["Title"].ToString ()%></a>
+                    </div>
+                    <div class="footer-right"></div>
+                </footer>
+            </div>
+        </div>
+    </form>
+ 
+ <script>
+     window.onload = function () {
+
+         var formStatus = document.getElementById("Isformupload").value;
+         var compId = document.getElementById("CompID").value;
+
+         if (compId === "1102" && (formStatus === "P" || formStatus === "")) {
+
+             alert("You have not uploaded the form. Please upload the form to continue.");
+
+             window.location.href = "UploadForm.aspx";
+         }
+
+     };
+ </script>
+    <script src="assets/js/app.min.js"></script>
+    <script src="assets/bundles/apexcharts/apexcharts.min.js"></script>
+    <script src="assets/bundles/jqvmap/dist/jquery.vmap.min.js"></script>
+    <script src="assets/bundles/jqvmap/dist/maps/jquery.vmap.world.js"></script>
+    <script src="assets/js/page/index.js"></script>
+    <script src="assets/js/scripts.js"></script>
+    <script src="assets/js/custom.js"></script>
+
+    <script src="../disable.js"></script>
+
+    <%-- ===== Voice Assistant (Mistral + Web Speech) ===== --%>
+    <% if (Session["Status"] != null && Session["Status"].ToString() == "OK") { %>
+    <script type="text/javascript">
+        window.VoiceAICfg = {
+            endpoint: '<%= ResolveUrl("~/VoiceAI.ashx") %>',
+            home: '<%= ResolveUrl("~/Default.aspx") %>',
+            logout: '<%= ResolveUrl("~/logout.aspx") %>',
+            lang: 'hi-IN'
+        };
+    </script>
+    <script src='<%= ResolveUrl("~/assets/js/VoiceAssistant.js") %>?v=2.0'></script>
+    <% } %>
+    <%-- ===== /Voice Assistant ===== --%>
+</body>
+</html>
