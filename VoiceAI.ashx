@@ -1,250 +1,324 @@
 <%@ WebHandler Language="C#" Class="VoiceAI" %>
 
+/*
+ * VoiceAI.ashx
+ * ----------------------------------------------------------------------------
+ * Server-side proxy for the AI Voice Assistant.
+ *
+ * Why server-side?
+ *   The Mistral API key MUST NOT live in the browser. The browser sends the
+ *   recognised speech transcript to this handler; the handler calls Mistral
+ *   with the key (read from Web.config <appSettings>) and returns a clean,
+ *   strict-JSON "intent" object that VoiceAssistant.js can act on.
+ *
+ * Dependencies: NONE beyond the default .NET 4.7.2 / System.Web stack.
+ *   - HttpWebRequest      -> no NuGet, no extra assembly reference
+ *   - JavaScriptSerializer -> System.Web.Extensions (always referenced)
+ *
+ * Contract
+ *   Request  (POST, application/json):
+ *     { "text": "<spoken transcript>", "menu": ["Dashboard","Wallet",...],
+ *       "page": "AllWalletReport.aspx" }
+ *   Response (application/json):
+ *     { "action":"navigate|search|fill|click|filter|none",
+ *       "target":"...", "query":"...", "value":"...", "say":"...",
+ *       "source":"mistral|fallback" }
+ * ----------------------------------------------------------------------------
+ */
+
 using System;
 using System.IO;
 using System.Net;
 using System.Text;
 using System.Web;
-using System.Web.SessionState;
-using System.Configuration;
 using System.Collections.Generic;
+using System.Configuration;
 using System.Web.Script.Serialization;
 
-/// <summary>
-/// Voice command parser for cpanel.BasicmlmCSharp (Mistral AI).
-/// Receives { text, page, menus[] } from VoiceAssistant.js and returns ONE
-/// strict intent JSON. The Mistral API key never leaves the server.
-///
-/// IMPORTANT: cpanel's sidebar menu is DB-driven, so the client sends the
-/// LIVE menu item labels in "menus". For navigate, the model must return the
-/// EXACT matching menu label in "page" - the front-end then opens that menu
-/// item's real href. No hard-coded page/file map (that was the earlier bug).
-/// </summary>
-public class VoiceAI : IHttpHandler, IRequiresSessionState
+public class VoiceAI : IHttpHandler
 {
     private const string MistralUrl = "https://api.mistral.ai/v1/chat/completions";
 
-    // Base instructions; the live menu list is appended per-request.
-    private const string SystemPromptBase = @"You are the voice command parser for an MLM member cPanel (Hindi+English users).
-The user speaks in Hinglish (Hindi+English mix), Devanagari Hindi, or pure English.
-Convert their spoken command into ONE strict JSON object. Output ONLY JSON, no markdown, no extra text.
-
-Schema:
-{
-  ""intent"": ""navigate"" | ""filter"" | ""fill"" | ""guidedfill"" | ""unknown"",
-  ""page"": ""<for navigate: the EXACT menu label from AVAILABLE MENU ITEMS that best matches; else empty>"",
-  ""filters"": { ""query"": ""<free text to match table rows>"" },
-  ""fields"": { ""<fieldName>"": ""<value>"" },
-  ""speak"": ""<very short confirmation, max 8 words>"",
-  ""speakLang"": ""hi"" | ""en""
-}
-
-LANGUAGE RULE (important):
-- Devanagari Hindi, romanized Hindi/Hinglish (profile kholo), aur pure English (open profile) -
-  teeno ko EQUALLY samjho. Script matter nahi karti.
-- ""speakLang"" = user jis language/feel me bola usi me reply: mostly Hindi/Hinglish -> ""hi""
-  aur ""speak"" Hinglish me. Pure English -> ""en"" aur ""speak"" English me.
-- ""speak"" hamesha short. filters.query / fields values translate MAT karo (naam/mobile/amount as-is).
-
-NAVIGATION (very important):
-- For navigate, ALWAYS pick the closest item from the AVAILABLE MENU ITEMS list below and put
-  its EXACT text (as listed) in ""page"". Do NOT invent file names or keys.
-- Examples: ""profile kholo""/""open profile"" -> closest is likely ""Edit Profile"" or ""Profile"".
-  ""edit profile"" -> ""Edit Profile"". ""new registration""/""naya registration"" -> ""New Registration"".
-  ""login password change""/""password badlo"" -> ""Change Login Password"".
-  ""transaction password"" -> ""Change Trans. Password"". ""kyc"" -> ""Upload KYC"".
-  ""my team""/""meri team"" -> ""My Team"". ""wallet"" -> ""Wallet"". ""home""/""ghar"" -> ""Home"".
-  ""logout""/""sign out"" -> ""Logout"" (or the closest logout item).
-- If nothing in the list matches, intent=unknown with a short polite speak.
-
-OTHER INTENTS:
-- ""Rakesh dikhao"", ""filter 9001234567"" on a report/grid -> intent=filter, filters.query=<text>.
-- Form bharo with values -> intent=fill, fields={...} (only fields the user said).
-- ""step by step bharo"", ""ek ek karke poochho"", ""guided fill"" -> intent=guidedfill.
-- Command clear nahi -> intent=unknown with a short polite speak in user's language.";
-
-    private static readonly bool _tlsReady = EnsureTls();
-    private static bool EnsureTls()
-    {
-        try { ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12; }
-        catch { }
-        return true;
-    }
-
-    private const string Fallback =
-        "{\"intent\":\"unknown\",\"speak\":\"Maaf kijiye, samajh nahi aaya\",\"speakLang\":\"hi\"}";
-
     public void ProcessRequest(HttpContext context)
     {
-        context.Response.ContentType = "application/json; charset=utf-8";
-        context.Response.ContentEncoding = Encoding.UTF8;
+        context.Response.ContentType = "application/json";
+        // This endpoint is same-origin only; reflect no wildcard CORS.
         context.Response.Cache.SetCacheability(HttpCacheability.NoCache);
 
-        string outJson;
+        var serializer = new JavaScriptSerializer();
+        string result;
+
         try
         {
-            string body;
-            using (var sr = new StreamReader(context.Request.InputStream, Encoding.UTF8))
-                body = sr.ReadToEnd();
+            // ---- 1. Read & validate the incoming request -------------------
+            string rawBody;
+            using (var reader = new StreamReader(context.Request.InputStream, Encoding.UTF8))
+            {
+                rawBody = reader.ReadToEnd();
+            }
 
-            var ser = new JavaScriptSerializer();
-            var input = string.IsNullOrWhiteSpace(body)
+            var req = string.IsNullOrWhiteSpace(rawBody)
                 ? new Dictionary<string, object>()
-                : ser.Deserialize<Dictionary<string, object>>(body);
+                : (Dictionary<string, object>)serializer.DeserializeObject(rawBody);
 
-            string text  = GetStr(input, "text");
-            string page  = GetStr(input, "page");
-            string menus = JoinArr(input, "menus");
+            string userText = SafeString(req, "text");
+            // Hard sanitise: voice text is data, never markup/script.
+            userText = Sanitize(userText);
 
-            if (string.IsNullOrEmpty(text))
+            if (string.IsNullOrWhiteSpace(userText))
             {
-                context.Response.Write("{\"intent\":\"unknown\",\"speak\":\"Kuch sunai nahi diya\",\"speakLang\":\"hi\"}");
+                context.Response.Write(serializer.Serialize(new
+                {
+                    action = "none",
+                    say = "Maine kuch suna nahi. Dobara boliye.",
+                    source = "fallback"
+                }));
                 return;
             }
 
-            string key = ConfigurationManager.AppSettings["MistralApiKey"];
-            if (string.IsNullOrWhiteSpace(key) || key == "PUT_KEY_HERE" || key == "YAHAN_APNI_MISTRAL_KEY_DAALEIN")
+            string page = Sanitize(SafeString(req, "page"));
+            var menuItems = ExtractList(req, "menu");
+
+            // ---- 2. Try Mistral; fall back to local parser on any failure --
+            string apiKey = (ConfigurationManager.AppSettings["MistralApiKey"] ?? "").Trim();
+            string model = (ConfigurationManager.AppSettings["MistralModel"] ?? "mistral-small-latest").Trim();
+
+            if (!string.IsNullOrEmpty(apiKey))
             {
-                context.Response.Write("{\"intent\":\"unknown\",\"speak\":\"AI key configure nahi hai\",\"speakLang\":\"hi\"}");
-                return;
+                string intentJson = CallMistral(apiKey, model, userText, page, menuItems);
+                if (!string.IsNullOrEmpty(intentJson))
+                {
+                    // Validate it parses; attach source marker.
+                    var parsed = serializer.DeserializeObject(intentJson) as Dictionary<string, object>;
+                    if (parsed != null && parsed.ContainsKey("action"))
+                    {
+                        parsed["source"] = "mistral";
+                        context.Response.Write(serializer.Serialize(parsed));
+                        return;
+                    }
+                }
             }
-            key = key.Trim().Trim('"', '\'');
-            if (key.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
-                key = key.Substring(7).Trim();
 
-            string model = ConfigurationManager.AppSettings["MistralModel"];
-            if (string.IsNullOrWhiteSpace(model)) model = "mistral-small-latest";
-
-            string systemPrompt = SystemPromptBase +
-                "\n\nAVAILABLE MENU ITEMS (match navigate target to one of these, return its EXACT text):\n" +
-                (string.IsNullOrEmpty(menus) ? "(none provided)" : menus);
-
-            string userMsg = "Current page file: " + page + "\nUser said: " + text;
-
-            outJson = CallMistral(key, model, systemPrompt, userMsg, ser);
+            // ---- 3. Local rule-based fallback ------------------------------
+            result = serializer.Serialize(LocalParse(userText, menuItems));
         }
-        catch (Exception)
+        catch (Exception ex)
         {
-            outJson = Fallback;
+            result = serializer.Serialize(new
+            {
+                action = "none",
+                say = "Server par dikkat aa gayi. Thodi der baad try karein.",
+                source = "error",
+                error = ex.Message
+            });
         }
 
-        context.Response.Write(outJson);
+        context.Response.Write(result);
     }
 
-    private string CallMistral(string key, string model, string systemPrompt, string userMsg, JavaScriptSerializer ser)
-    {
-        var payload = new Dictionary<string, object>();
-        payload.Add("model", model);
-        payload.Add("temperature", 0.1);
-
-        var responseFormat = new Dictionary<string, object>();
-        responseFormat.Add("type", "json_object");
-        payload.Add("response_format", responseFormat);
-
-        var sysMsg = new Dictionary<string, object>();
-        sysMsg.Add("role", "system");
-        sysMsg.Add("content", systemPrompt);
-
-        var usrMsg = new Dictionary<string, object>();
-        usrMsg.Add("role", "user");
-        usrMsg.Add("content", userMsg);
-
-        payload.Add("messages", new object[] { sysMsg, usrMsg });
-
-        byte[] bytes = Encoding.UTF8.GetBytes(ser.Serialize(payload));
-
-        var req = (HttpWebRequest)WebRequest.Create(MistralUrl);
-        req.Method = "POST";
-        req.ContentType = "application/json";
-        req.Accept = "application/json";
-        req.Headers["Authorization"] = "Bearer " + key;
-        req.Timeout = 20000;
-        req.ReadWriteTimeout = 20000;
-        req.ContentLength = bytes.Length;
-
-        try
-        {
-            using (var rs = req.GetRequestStream())
-                rs.Write(bytes, 0, bytes.Length);
-
-            string respText;
-            using (var resp = (HttpWebResponse)req.GetResponse())
-            using (var rdr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
-                respText = rdr.ReadToEnd();
-
-            string content = ExtractContent(respText, ser);
-            if (string.IsNullOrWhiteSpace(content)) return Fallback;
-
-            content = StripFences(content).Trim();
-            if (!content.StartsWith("{")) return Fallback;
-            return content;
-        }
-        catch (WebException)
-        {
-            return Fallback;
-        }
-    }
-
-    private static string ExtractContent(string respText, JavaScriptSerializer ser)
+    // ------------------------------------------------------------------ Mistral
+    private string CallMistral(string apiKey, string model, string userText,
+                               string page, List<string> menuItems)
     {
         try
         {
-            var root = ser.Deserialize<Dictionary<string, object>>(respText);
-            object choicesObj;
-            if (!root.TryGetValue("choices", out choicesObj)) return null;
-            var choices = choicesObj as object[];
-            if (choices == null || choices.Length == 0) return null;
+            string menuList = (menuItems != null && menuItems.Count > 0)
+                ? string.Join(", ", menuItems)
+                : "(unknown)";
 
-            var choice0 = choices[0] as Dictionary<string, object>;
-            if (choice0 == null) return null;
+            string systemPrompt =
+                "You are the intent parser for an MLM cPanel web application. " +
+                "The user speaks in Hindi, English or Hinglish and may have typos. " +
+                "Convert the user's command into ONE JSON object and reply with JSON ONLY " +
+                "(no markdown, no code fences, no explanation). Schema:\n" +
+                "{\"action\":\"navigate|search|filter|fill|click|none\"," +
+                "\"target\":\"\",\"query\":\"\",\"value\":\"\",\"say\":\"\"}\n" +
+                "Rules:\n" +
+                "- If the user uses an open/go verb (kholo, kolo, khol, open, jaao, jao, dikhao, " +
+                "show, go to, खोलो, दिखाओ, जाओ), the action is ALWAYS 'navigate'. " +
+                "Set target to the closest matching menu item from the list below. " +
+                "A menu item is NEVER action 'click'.\n" +
+                "- action 'click' is ONLY for in-page action buttons: Save, Update, Delete, " +
+                "Search, Reset, Cancel, Approve, Reject, Print, Export, Upload, Download, " +
+                "Generate Invoice, Submit. Set target to that button label.\n" +
+                "- action 'search'/'filter': set query to the text to find in the current grid.\n" +
+                "- action 'fill': target = field label, value = value to type.\n" +
+                "- Always pick target from the Available menu items when navigating, even if " +
+                "the user's word is misspelled (fuzzy match).\n" +
+                "- 'say' = a very short confirmation in the user's language.\n" +
+                "Available menu items: " + menuList + ".\n" +
+                "Current page: " + page + ".";
 
-            object msgObj;
-            if (!choice0.TryGetValue("message", out msgObj)) return null;
-            var msg = msgObj as Dictionary<string, object>;
-            if (msg == null) return null;
+            var payload = new Dictionary<string, object>
+            {
+                { "model", model },
+                { "temperature", 0 },
+                { "messages", new object[]
+                    {
+                        new Dictionary<string,object>{ {"role","system"}, {"content", systemPrompt} },
+                        new Dictionary<string,object>{ {"role","user"}, {"content", userText} }
+                    }
+                }
+            };
 
-            object contentObj;
-            if (!msg.TryGetValue("content", out contentObj)) return null;
-            return contentObj as string;
+            var serializer = new JavaScriptSerializer();
+            byte[] body = Encoding.UTF8.GetBytes(serializer.Serialize(payload));
+
+            // TLS 1.2 for older runtimes.
+            ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+
+            var http = (HttpWebRequest)WebRequest.Create(MistralUrl);
+            http.Method = "POST";
+            http.ContentType = "application/json";
+            http.Accept = "application/json";
+            http.Headers["Authorization"] = "Bearer " + apiKey;
+            http.Timeout = 15000;
+            http.ContentLength = body.Length;
+
+            using (var stream = http.GetRequestStream())
+            {
+                stream.Write(body, 0, body.Length);
+            }
+
+            using (var response = (HttpWebResponse)http.GetResponse())
+            using (var sr = new StreamReader(response.GetResponseStream(), Encoding.UTF8))
+            {
+                string respText = sr.ReadToEnd();
+                var obj = serializer.DeserializeObject(respText) as Dictionary<string, object>;
+                if (obj == null) return null;
+
+                // choices[0].message.content
+                var choices = obj.ContainsKey("choices") ? obj["choices"] as object[] : null;
+                if (choices == null || choices.Length == 0) return null;
+
+                var first = choices[0] as Dictionary<string, object>;
+                var message = first != null && first.ContainsKey("message")
+                    ? first["message"] as Dictionary<string, object> : null;
+                string content = message != null && message.ContainsKey("content")
+                    ? message["content"] as string : null;
+
+                return CleanJson(content);
+            }
         }
-        catch { return null; }
+        catch
+        {
+            // Any network/parse error -> let caller use local fallback.
+            return null;
+        }
     }
 
-    private static string StripFences(string s)
+    // Strip accidental ```json fences / leading prose, keep the JSON object.
+    private string CleanJson(string s)
     {
-        if (string.IsNullOrEmpty(s)) return s;
+        if (string.IsNullOrWhiteSpace(s)) return null;
         s = s.Trim();
-        if (s.StartsWith("```"))
-        {
-            int nl = s.IndexOf('\n');
-            if (nl >= 0) s = s.Substring(nl + 1);
-            int fence = s.LastIndexOf("```", StringComparison.Ordinal);
-            if (fence >= 0) s = s.Substring(0, fence);
-        }
-        return s.Trim();
+        s = s.Replace("```json", "").Replace("```", "").Trim();
+        int start = s.IndexOf('{');
+        int end = s.LastIndexOf('}');
+        if (start >= 0 && end > start) return s.Substring(start, end - start + 1);
+        return null;
     }
 
-    private static string GetStr(Dictionary<string, object> d, string k)
+    // --------------------------------------------------- Local rule-based parse
+    private object LocalParse(string text, List<string> menuItems)
     {
-        object v;
-        if (d != null && d.TryGetValue(k, out v) && v != null) return v.ToString().Trim();
+        string t = text.ToLowerInvariant().Trim();
+
+        // Button / action keywords (Hindi + English).
+        string[][] buttonMap = new string[][]
+        {
+            new[]{ "save", "save|सेव|सहेज|जमा करो" },
+            new[]{ "search", "search|खोज|ढूंढ|find" },
+            new[]{ "reset", "reset|रीसेट|साफ|clear" },
+            new[]{ "print", "print|प्रिंट|छाप" },
+            new[]{ "export", "export|excel|pdf|डाउनलोड export" },
+            new[]{ "approve", "approve|अप्रूव|स्वीकार|मंजूर" },
+            new[]{ "reject", "reject|रिजेक्ट|अस्वीकार|नामंजूर" },
+            new[]{ "update", "update|अपडेट" },
+            new[]{ "delete", "delete|डिलीट|हटा" }
+        };
+        foreach (var pair in buttonMap)
+        {
+            foreach (var kw in pair[1].Split('|'))
+            {
+                if (t.Contains(kw)) return new { action = "click", target = pair[0], say = pair[0] + " kar raha hoon.", source = "fallback" };
+            }
+        }
+
+        // Grid search: "search <x>" / "खोजो <x>"
+        foreach (var prefix in new[] { "search ", "find ", "खोजो ", "खोज ", "ढूंढो " })
+        {
+            int idx = t.IndexOf(prefix, StringComparison.Ordinal);
+            if (idx >= 0)
+            {
+                string q = text.Substring(idx + prefix.Length).Trim();
+                if (q.Length > 0)
+                    return new { action = "search", query = q, say = "\"" + q + "\" search kar raha hoon.", source = "fallback" };
+            }
+        }
+
+        // Navigation: best fuzzy match against the supplied menu items.
+        if (menuItems != null && menuItems.Count > 0)
+        {
+            string best = null; int bestScore = int.MaxValue;
+            foreach (var m in menuItems)
+            {
+                if (string.IsNullOrWhiteSpace(m)) continue;
+                string ml = m.ToLowerInvariant();
+                int score;
+                if (t.Contains(ml) || ml.Contains(t)) score = 0;
+                else score = Levenshtein(t, ml);
+                if (score < bestScore) { bestScore = score; best = m; }
+            }
+            // Accept only reasonably close matches.
+            if (best != null && bestScore <= Math.Max(3, best.Length / 2))
+                return new { action = "navigate", target = best, say = best + " khol raha hoon.", source = "fallback" };
+        }
+
+        return new { action = "none", say = "Samajh nahi paaya. Dobara boliye.", source = "fallback" };
+    }
+
+    // ----------------------------------------------------------------- Helpers
+    private static int Levenshtein(string a, string b)
+    {
+        if (string.IsNullOrEmpty(a)) return (b ?? "").Length;
+        if (string.IsNullOrEmpty(b)) return a.Length;
+        int[,] d = new int[a.Length + 1, b.Length + 1];
+        for (int i = 0; i <= a.Length; i++) d[i, 0] = i;
+        for (int j = 0; j <= b.Length; j++) d[0, j] = j;
+        for (int i = 1; i <= a.Length; i++)
+            for (int j = 1; j <= b.Length; j++)
+            {
+                int cost = a[i - 1] == b[j - 1] ? 0 : 1;
+                d[i, j] = Math.Min(Math.Min(d[i - 1, j] + 1, d[i, j - 1] + 1), d[i - 1, j - 1] + cost);
+            }
+        return d[a.Length, b.Length];
+    }
+
+    private static string SafeString(Dictionary<string, object> d, string key)
+    {
+        if (d != null && d.ContainsKey(key) && d[key] != null) return d[key].ToString();
         return "";
     }
 
-    // Join a JSON string-array (sent as object[]) into a comma list for the prompt.
-    private static string JoinArr(Dictionary<string, object> d, string k)
+    private static List<string> ExtractList(Dictionary<string, object> d, string key)
     {
-        object v;
-        if (d == null || !d.TryGetValue(k, out v) || v == null) return "";
-        var arr = v as object[];
-        if (arr == null) return "";
-        var parts = new List<string>();
-        foreach (var o in arr)
+        var list = new List<string>();
+        if (d != null && d.ContainsKey(key) && d[key] is object[])
         {
-            string s = (o ?? "").ToString().Trim();
-            if (s.Length > 0) parts.Add(s);
+            foreach (var o in (object[])d[key])
+                if (o != null) list.Add(o.ToString());
         }
-        return string.Join(", ", parts);
+        return list;
+    }
+
+    // Remove anything that could enable XSS/HTML/script injection from voice text.
+    private static string Sanitize(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return "";
+        s = s.Replace("<", " ").Replace(">", " ").Replace("\"", " ").Replace("'", " ");
+        if (s.Length > 500) s = s.Substring(0, 500);
+        return s.Trim();
     }
 
     public bool IsReusable { get { return false; } }

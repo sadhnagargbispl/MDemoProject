@@ -1,404 +1,642 @@
-/* ==========================================================================
- *  VoiceAssistant.js   -   cpanel.BasicmlmCSharp (WebForms)
- * --------------------------------------------------------------------------
- *  Mistral + Web Speech API voice assistant.
+/* ============================================================================
+ * VoiceAssistant.js  (v2.0)
+ * AI Voice Command System for the MLM cPanel (ASP.NET WebForms, Stisla template)
  *
- *  Flow:
- *    mic tap -> SpeechRecognition (hi-IN; understands Hinglish/English)
- *            -> scan LIVE sidebar menu (label + real href)
- *            -> POST { text, page:<current aspx>, menus:[labels] } to VoiceAI.ashx
- *            -> receive { intent, page, filters, fields, speak, speakLang }
- *            -> navigate: open the menu item whose label == page (exact/fuzzy)
- *               filter / fill / guidedfill: act on the current page
- *            -> speak the AI's confirmation in its language (hi/en).
+ * Loaded by SitePage.master only for logged-in users. Config comes from the
+ * global window.VoiceAICfg = { endpoint, home, logout, lang }.
  *
- *  cpanel's menu is DB-driven, so navigation is driven entirely by the LIVE
- *  menu the user actually sees - nothing is hard-coded.
- *
- *  Pure vanilla JS - no jQuery. Additive, self-contained.
+ * Design: one IIFE, internal modules so concerns stay separated
+ * (Speech / Nav / Grid / Forms / Buttons / Fuzzy / Intent / Router / UI).
+ * No external library required; uses jQuery & DataTables only if already present.
+ * All user/voice text is treated as data -> inserted with textContent only.
  * ========================================================================== */
 (function () {
     "use strict";
 
-    if (window.__voiceAILoaded) return;
-    window.__voiceAILoaded = true;
+    if (window.__VoiceAILoaded) return;      // guard against double-injection
+    window.__VoiceAILoaded = true;
 
-    var CFG = window.VoiceAICfg || {};
-    var ENDPOINT = CFG.endpoint || "VoiceAI.ashx";
-    var HOME = CFG.home || "Index.aspx";
-    var LOGOUT = CFG.logout || "logout.aspx";
-    var LANG = CFG.lang || "hi-IN";
+    var Cfg = window.VoiceAICfg || {};
+    var LANG = Cfg.lang || "hi-IN";
+    var ENDPOINT = Cfg.endpoint || "VoiceAI.ashx";
 
-    function currentPageFile() {
-        var p = (location.pathname || "").split("/").pop();
-        return p || "Index.aspx";
-    }
-
-    // ======================================================================
-    //  1.  UI
-    // ======================================================================
-    var fab, pill, isListening = false;
-
-    function injectUI() {
-        var css = document.createElement("style");
-        css.textContent =
-            ".vai-fab{position:fixed;right:22px;bottom:22px;width:60px;height:60px;border-radius:50%;" +
-            "background:#6777ef;color:#fff;border:none;box-shadow:0 6px 18px rgba(103,119,239,.45);" +
-            "cursor:pointer;z-index:99999;display:flex;align-items:center;justify-content:center;" +
-            "transition:transform .15s,background .2s;font-size:24px;}" +
-            ".vai-fab:hover{transform:scale(1.08);}" +
-            ".vai-fab.listening{background:#fc544b;animation:vaiPulse 1.1s infinite;}" +
-            ".vai-fab.guided{background:#47c363;}" +
-            "@keyframes vaiPulse{0%{box-shadow:0 0 0 0 rgba(252,84,75,.55);}70%{box-shadow:0 0 0 16px rgba(252,84,75,0);}100%{box-shadow:0 0 0 0 rgba(252,84,75,0);}}" +
-            ".vai-pill{position:fixed;right:22px;bottom:92px;max-width:320px;background:#1f2533;color:#fff;" +
-            "padding:10px 14px;border-radius:12px;font-size:13px;line-height:1.4;z-index:99999;" +
-            "box-shadow:0 6px 18px rgba(0,0,0,.25);opacity:0;transform:translateY(8px);" +
-            "transition:opacity .2s,transform .2s;pointer-events:none;}" +
-            ".vai-pill.show{opacity:1;transform:translateY(0);}" +
-            ".vai-field-hi{outline:2px solid #6777ef !important;outline-offset:1px;transition:outline .2s;}";
-        document.head.appendChild(css);
-
-        fab = document.createElement("button");
-        fab.type = "button";
-        fab.className = "vai-fab";
-        fab.title = "Voice Assistant - tap and speak your command";
-        fab.innerHTML = "&#127908;";
-        fab.addEventListener("click", function (e) { e.preventDefault(); toggleListen(); });
-        document.body.appendChild(fab);
-
-        pill = document.createElement("div");
-        pill.className = "vai-pill";
-        document.body.appendChild(pill);
-    }
-
-    var pillTimer = null;
-    function showPill(text, keep) {
-        if (!pill) return;
-        pill.textContent = text;
-        pill.classList.add("show");
-        if (pillTimer) clearTimeout(pillTimer);
-        if (!keep) pillTimer = setTimeout(function () { pill.classList.remove("show"); }, 4500);
-    }
-
-    // ======================================================================
-    //  2.  Speech synthesis (bilingual)
-    // ======================================================================
-    var voices = [];
-    function loadVoices() { if ("speechSynthesis" in window) voices = window.speechSynthesis.getVoices() || []; }
-    if ("speechSynthesis" in window) { loadVoices(); window.speechSynthesis.onvoiceschanged = loadVoices; }
-    function voiceFor(lc) {
-        var rx = (lc === "en") ? /en[-_](IN|US|GB)/i : /hi[-_]IN/i;
-        return voices.filter(function (v) { return rx.test(v.lang); })[0] ||
-            voices.filter(function (v) { return new RegExp("^" + (lc || "en"), "i").test(v.lang); })[0] ||
-            voices[0] || null;
-    }
-    function speak(text, speakLang) {
-        if (!text) return;
-        showPill(text);
-        if (!("speechSynthesis" in window)) return;
-        var lc = (speakLang === "en") ? "en" : "hi";
-        try {
-            window.speechSynthesis.cancel();
-            var u = new SpeechSynthesisUtterance(text);
-            u.lang = (lc === "en") ? "en-IN" : "hi-IN";
-            var v = voiceFor(lc); if (v) u.voice = v;
-            u.rate = 1; u.pitch = 1;
-            window.speechSynthesis.speak(u);
-        } catch (e) { }
-    }
-
-    // ======================================================================
-    //  3.  Speech recognition
-    // ======================================================================
-    var recog = null;
-    function getRecognizer() {
-        var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-        if (!SR) return null;
-        var r = new SR();
-        r.lang = LANG; r.interimResults = false; r.maxAlternatives = 1; r.continuous = false;
-        return r;
-    }
-    var routeResult = null;
-    function toggleListen() {
-        if (isListening) { stopListen(); return; }
-        if (!recog) recog = getRecognizer();
-        if (!recog) { speak("Voice input is not supported in this browser. Please use Chrome.", "en"); return; }
-        try { window.speechSynthesis && window.speechSynthesis.cancel(); } catch (e) { }
-        recog.onstart = function () {
-            isListening = true;
-            fab.classList.add(guided.active ? "guided" : "listening");
-            showPill(guided.active ? ("Listening for: " + guided.label) : "Listening... please speak", true);
-        };
-        recog.onerror = function (ev) {
-            isListening = false; fab.classList.remove("listening", "guided");
-            if (ev.error === "no-speech") showPill("I didn't catch that.");
-            else if (ev.error === "not-allowed") speak("Please allow microphone access.", "en");
-            else showPill("Microphone error: " + ev.error);
-        };
-        recog.onend = function () { isListening = false; fab.classList.remove("listening", "guided"); };
-        recog.onresult = function (ev) {
-            var t = "";
-            for (var i = 0; i < ev.results.length; i++) t += ev.results[i][0].transcript;
-            t = (t || "").trim();
-            if (!t) { showPill("I didn't catch that."); return; }
-            showPill("\u201C" + t + "\u201D", true);
-            if (routeResult) { var fn = routeResult; routeResult = null; fn(t); }
-            else handleCommand(t);
-        };
-        try { recog.start(); } catch (e) { }
-    }
-    function stopListen() { try { recog && recog.stop(); } catch (e) { } isListening = false; fab.classList.remove("listening", "guided"); }
-    function listenOnce(cb) { routeResult = cb; toggleListen(); }
-
-    // ======================================================================
-    //  4.  DOM helpers
-    // ======================================================================
-    function isVisible(el) {
-        if (!el) return false;
-        if (el.offsetParent === null && el.tagName !== "BODY") {
-            var st = window.getComputedStyle(el); if (st.position !== "fixed") return false;
-        }
-        var s2 = window.getComputedStyle(el);
-        return s2.display !== "none" && s2.visibility !== "hidden";
-    }
-    function prettify(s) {
-        if (!s) return "";
-        s = s.replace(/^(txt|cmb|ddl|lbl|btn)/i, "");
-        s = s.replace(/[_\-]+/g, " ").replace(/([a-z])([A-Z])/g, "$1 $2");
-        return s.replace(/\s+/g, " ").trim();
-    }
-    function cssEscape(s) { return (window.CSS && CSS.escape) ? CSS.escape(s) : s.replace(/([^\w-])/g, "\\$1"); }
-    function fieldLabel(el) {
-        if (el.placeholder && el.placeholder.trim()) return el.placeholder.trim();
-        if (el.id) { var lab = document.querySelector('label[for="' + cssEscape(el.id) + '"]'); if (lab && lab.textContent.trim()) return lab.textContent.trim(); }
-        var p = el.closest ? el.closest("label") : null;
-        if (p && p.textContent.trim()) return p.textContent.trim();
-        if (el.getAttribute("aria-label")) return el.getAttribute("aria-label").trim();
-        if (el.name) return prettify(el.name.split("$").pop());
-        if (el.id) return prettify(el.id.split("_").pop());
-        return "";
-    }
-    function scanFields() {
-        var list = [];
-        document.querySelectorAll(
-            'input[type=text],input[type=email],input[type=number],input[type=tel],' +
-            'input[type=date],input[type=search],input[type=url],input[type=password],' +
-            'input:not([type]),textarea,select').forEach(function (el) {
-                if (el.disabled || el.readOnly || el.type === "hidden") return;
-                if (!isVisible(el)) return;
-                var label = fieldLabel(el); if (!label) return;
-                list.push({ label: label, el: el });
-            });
-        return list;
-    }
-    // LIVE menu - navigable anchors (real href). Template-agnostic:
-    //   1) try the usual menu containers
-    //   2) if too few found, fall back to EVERY <a> on the page whose href
-    //      points to an .aspx page (works regardless of menu CSS structure).
-    function collectAnchors(nodeList, list, seen) {
-        nodeList.forEach(function (a) {
-            var href = a.getAttribute("href") || "";
-            var text = (a.textContent || "").replace(/\s+/g, " ").trim();
-            if (!text || text.length > 40) return;
-            if (!href || href === "#" || href.toLowerCase().indexOf("javascript:") === 0) return;
-            var key = text.toLowerCase();
-            if (seen[key]) return;
-            seen[key] = true;
-            list.push({ label: text, href: a.href }); // resolved absolute href
-        });
-    }
-    function scanMenuAnchors() {
-        var list = [], seen = {};
-        collectAnchors(document.querySelectorAll('.sidebar-menu a, #menu a, nav a, .navbar-nav a, aside a, .menu a, .sidebar a'), list, seen);
-        if (list.length < 3) {
-            // fallback: any anchor that links to an .aspx page
-            var all = [];
-            document.querySelectorAll('a[href]').forEach(function (a) {
-                if (/\.aspx(\?|#|$)/i.test(a.getAttribute("href") || "")) all.push(a);
-            });
-            collectAnchors(all, list, seen);
-        }
-        try { window.__vaiMenus = list.map(function (m) { return m.label; }); } catch (e) { }
-        return list;
-    }
-
-    // ----- fuzzy -----
-    function norm(s) { return (s || "").toLowerCase().replace(/[^a-z0-9\u0900-\u097F ]/g, "").replace(/\s+/g, " ").trim(); }
-    function lev(a, b) {
-        a = a || ""; b = b || ""; var m = a.length, n = b.length; if (!m) return n; if (!n) return m;
-        var prev = [], cur = [], i, j;
-        for (j = 0; j <= n; j++) prev[j] = j;
-        for (i = 1; i <= m; i++) { cur[0] = i; for (j = 1; j <= n; j++) { var cost = a.charAt(i - 1) === b.charAt(j - 1) ? 0 : 1; cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost); } for (j = 0; j <= n; j++) prev[j] = cur[j]; }
-        return prev[n];
-    }
-    function bestMatch(wanted, list, minScore) {
-        if (!wanted || !list || !list.length) return null;
-        var w = norm(wanted), best = null, bestScore = -1;
-        list.forEach(function (item) {
-            var c = norm(item.label); if (!c) return;
-            var score;
-            if (c === w) score = 1;
-            else if (c.indexOf(w) >= 0 || w.indexOf(c) >= 0) score = 0.85;
-            else { score = 1 - lev(w, c) / (Math.max(w.length, c.length) || 1); }
-            if (score > bestScore) { bestScore = score; best = item; }
-        });
-        return bestScore >= (minScore || 0.5) ? best : null;
-    }
-    function normValue(v) {
-        if (v == null) return "";
-        var map = { "\u0966": "0", "\u0967": "1", "\u0968": "2", "\u0969": "3", "\u096A": "4", "\u096B": "5", "\u096C": "6", "\u096D": "7", "\u096E": "8", "\u096F": "9" };
-        return String(v).replace(/[\u0966-\u096F]/g, function (c) { return map[c]; });
-    }
-    function setFieldValue(el, value) {
-        if (!el) return;
-        el.classList.add("vai-field-hi"); setTimeout(function () { el.classList.remove("vai-field-hi"); }, 1500);
-        if (el.tagName === "SELECT") {
-            var opts = el.options, matched = false;
-            for (var i = 0; i < opts.length; i++) { if (norm(opts[i].text) === norm(value) || norm(opts[i].text).indexOf(norm(value)) >= 0) { el.selectedIndex = i; matched = true; break; } }
-            if (!matched && value) { var best = -1, bi = -1; for (var j = 0; j < opts.length; j++) { var s = 1 - lev(norm(value), norm(opts[j].text)) / (Math.max(norm(value).length, norm(opts[j].text).length) || 1); if (s > best) { best = s; bi = j; } } if (best >= 0.5 && bi >= 0) el.selectedIndex = bi; }
-        } else { try { el.focus(); } catch (e) { } el.value = value; }
-        el.dispatchEvent(new Event("input", { bubbles: true }));
-        el.dispatchEvent(new Event("change", { bubbles: true }));
-        try { el.blur(); } catch (e) { }
-    }
-
-    // ======================================================================
-    //  5.  Pipeline
-    // ======================================================================
-    function handleCommand(raw) {
-        showPill("Thinking...", true);
-        var menus = scanMenuAnchors();
-        var payload = { text: raw, page: currentPageFile(), menus: menus.map(function (m) { return m.label; }) };
-        try { console.log("[VoiceAI] menu items found:", payload.menus.length, payload.menus); console.log("[VoiceAI] sending:", payload); } catch (e) { }
-        var xhr = new XMLHttpRequest();
-        xhr.open("POST", ENDPOINT, true);
-        xhr.setRequestHeader("Content-Type", "application/json");
-        xhr.timeout = 25000;
-        xhr.onreadystatechange = function () {
-            if (xhr.readyState !== 4) return;
-            if (xhr.status < 200 || xhr.status >= 300) { speak("Server error. Please try again.", "en"); return; }
-            var data;
-            try { console.log("[VoiceAI] raw response:", xhr.responseText); data = JSON.parse(xhr.responseText); }
-            catch (e) { speak("I couldn't understand the response.", "en"); return; }
-            executeIntent(data, menus);
-        };
-        xhr.ontimeout = function () { speak("The request timed out. Please try again.", "en"); };
-        xhr.onerror = function () { speak("Network error.", "en"); };
-        xhr.send(JSON.stringify(payload));
-    }
-
-    function executeIntent(obj, menus) {
-        var intent = (obj && obj.intent) || "unknown";
-        var sl = (obj && obj.speakLang) || "hi";
-        var say = (obj && obj.speak) || "";
-
-        switch (intent) {
-            case "navigate": {
-                var target = obj.page || "";
-                if (/^\s*(logout|log\s*out|sign\s*out)\s*$/i.test(target)) {
-                    var lo = bestMatch(target, menus, 0.5);
-                    if (say) speak(say, sl);
-                    setTimeout(function () { window.location.href = lo ? lo.href : LOGOUT; }, 600);
-                    break;
+    /* ----------------------------------------------------------- Fuzzy module */
+    var Fuzzy = {
+        norm: function (s) {
+            return (s || "").toString().toLowerCase()
+                .replace(/\s+/g, " ")
+                .replace(/[^\u0900-\u097Fa-z0-9 ]/g, "")  // keep Devanagari + latin + digits
+                .trim();
+        },
+        lev: function (a, b) {
+            a = a || ""; b = b || "";
+            var m = a.length, n = b.length;
+            if (!m) return n; if (!n) return m;
+            var prev = [], cur = [], i, j;
+            for (j = 0; j <= n; j++) prev[j] = j;
+            for (i = 1; i <= m; i++) {
+                cur[0] = i;
+                for (j = 1; j <= n; j++) {
+                    var cost = a.charAt(i - 1) === b.charAt(j - 1) ? 0 : 1;
+                    cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
                 }
-                var m = bestMatch(target, menus, 0.45);
-                if (m && m.href) {
-                    if (say) speak(say, sl); else showPill("Opening " + m.label);
-                    setTimeout(function () { window.location.href = m.href; }, 600);
-                } else {
-                    speak(say || ("Menu not found: " + target), sl);
-                    showPill("Menu not found: \"" + target + "\" (scanned " + menus.length + " menu items)", true);
-                }
-                break;
+                prev = cur.slice();
             }
-
-            case "filter": {
-                var q = obj.filters && obj.filters.query ? normValue(obj.filters.query) : "";
-                if (!q) { speak(say || "What should I filter?", sl); break; }
-                var ok = applyFilter(q);
-                speak(say || (ok ? ("Filtering " + q) : "No search box on this page."), sl);
-                break;
+            return prev[n];
+        },
+        // 0..1 similarity; rewards substring containment.
+        score: function (query, candidate) {
+            var q = this.norm(query), c = this.norm(candidate);
+            if (!q || !c) return 0;
+            if (q === c) return 1;
+            if (c.indexOf(q) >= 0 || q.indexOf(c) >= 0) return 0.9;
+            var d = this.lev(q, c);
+            var maxLen = Math.max(q.length, c.length);
+            return maxLen ? (1 - d / maxLen) : 0;
+        },
+        bestMatch: function (query, items, getText, threshold) {
+            threshold = threshold == null ? 0.55 : threshold;
+            var best = null, bestScore = 0;
+            for (var i = 0; i < items.length; i++) {
+                var text = getText ? getText(items[i]) : items[i];
+                var s = this.score(query, text);
+                if (s > bestScore) { bestScore = s; best = items[i]; }
             }
-
-            case "fill": {
-                var fields = obj.fields || {}, flds = scanFields(), done = 0, missed = [];
-                Object.keys(fields).forEach(function (k) {
-                    var f = bestMatch(k, flds, 0.5);
-                    if (f) { setFieldValue(f.el, normValue(fields[k])); done++; } else missed.push(k);
-                });
-                var msg = say || (done ? ("Filled " + done + " field" + (done > 1 ? "s" : "")) : "No matching field found");
-                if (!say && missed.length) msg += ". Not found: " + missed.join(", ");
-                speak(msg, sl);
-                break;
-            }
-
-            case "guidedfill":
-                startGuidedFill(sl);
-                break;
-
-            default:
-                speak(say || "Sorry, I didn't understand. Please try again.", sl);
+            return bestScore >= threshold ? best : null;
         }
-    }
+    };
 
-    function applyFilter(query) {
-        var flds = scanFields(), box = null;
-        flds.forEach(function (f) {
-            if (box) return;
-            if (/search|filter|find|khoj|naam|name|member|id/i.test(f.label) || f.el.type === "search") box = f.el;
-        });
-        if (!box && flds.length) box = flds[0].el;
-        if (!box) return false;
-        setFieldValue(box, query);
-        var btn = document.querySelector('input[type=submit][value*="Search" i],input[type=button][value*="Search" i],button[id*="Search" i],a[id*="Search" i]');
-        if (btn) setTimeout(function () { btn.click(); }, 300);
-        else box.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: "Enter", keyCode: 13 }));
-        return true;
-    }
+    /* ------------------------------------------------------------- UI module */
+    var UI = {
+        fab: null, panel: null, statusEl: null, transcriptEl: null,
+        build: function () {
+            var style = document.createElement("style");
+            style.textContent =
+                ".vai-fab{position:fixed;right:22px;bottom:22px;width:60px;height:60px;border-radius:50%;" +
+                "background:linear-gradient(135deg,#6f42c1,#4d7cfe);color:#fff;border:none;cursor:pointer;" +
+                "box-shadow:0 6px 20px rgba(77,124,254,.45);z-index:99999;display:flex;align-items:center;" +
+                "justify-content:center;transition:transform .15s ease}" +
+                ".vai-fab:hover{transform:scale(1.06)}" +
+                ".vai-fab.listening{animation:vaiPulse 1.2s infinite}" +
+                ".vai-fab svg{width:26px;height:26px;fill:#fff}" +
+                "@keyframes vaiPulse{0%{box-shadow:0 0 0 0 rgba(111,66,193,.55)}" +
+                "70%{box-shadow:0 0 0 18px rgba(111,66,193,0)}100%{box-shadow:0 0 0 0 rgba(111,66,193,0)}}" +
+                ".vai-panel{position:fixed;right:22px;bottom:92px;width:300px;max-width:86vw;background:#fff;" +
+                "border-radius:14px;box-shadow:0 10px 40px rgba(0,0,0,.18);z-index:99999;padding:14px 16px;" +
+                "font-family:inherit;display:none}" +
+                ".vai-panel.show{display:block}" +
+                ".vai-title{font-weight:600;color:#34395e;font-size:14px;margin-bottom:6px;display:flex;" +
+                "align-items:center;gap:6px}" +
+                ".vai-status{font-size:12px;color:#6c757d;min-height:16px}" +
+                ".vai-transcript{font-size:13px;color:#191d21;margin-top:8px;min-height:18px;word-break:break-word}" +
+                ".vai-hint{font-size:11px;color:#98a6ad;margin-top:8px;line-height:1.5}" +
+                ".vai-inputrow{display:flex;gap:6px;margin-top:10px}" +
+                ".vai-input{flex:1;min-width:0;border:1px solid #e3e6f0;border-radius:8px;padding:6px 9px;" +
+                "font-size:13px;color:#191d21;outline:none}" +
+                ".vai-input:focus{border-color:#6f42c1;box-shadow:0 0 0 2px rgba(111,66,193,.15)}" +
+                ".vai-send{border:none;border-radius:8px;padding:6px 12px;font-size:13px;font-weight:600;" +
+                "color:#fff;background:linear-gradient(135deg,#6f42c1,#4d7cfe);cursor:pointer}" +
+                ".vai-send:hover{opacity:.92}";
+            document.head.appendChild(style);
 
-    // ----- guided fill -----
-    var guided = { active: false, fields: [], idx: 0, label: "", lang: "hi" };
-    function startGuidedFill(lang) {
-        guided.fields = scanFields();
-        if (!guided.fields.length) { speak("There are no fields on this page.", lang); return; }
-        guided.active = true; guided.idx = 0; guided.lang = lang || "hi";
-        speak(lang === "en" ? "Starting guided fill. Say 'skip' to skip, 'stop' to cancel."
-            : "Guided fill shuru. 'skip' bolo chhodne ke liye, 'stop' bolo rokne ke liye.", lang);
-        setTimeout(nextGuidedField, 1800);
-    }
-    function nextGuidedField() {
-        if (!guided.active) return;
-        if (guided.idx >= guided.fields.length) { finishGuided(); return; }
-        var f = guided.fields[guided.idx];
-        if (!f.el || f.el.disabled || !isVisible(f.el)) { guided.idx++; return nextGuidedField(); }
-        guided.label = f.label;
-        speak(guided.lang === "en" ? ("Say value for " + f.label) : (f.label + " boliye"), guided.lang);
-        setTimeout(function () {
-            listenOnce(function (spoken) {
-                var low = spoken.toLowerCase().trim();
-                if (/^(stop|cancel|band karo|ruk(o|jao)?)$/.test(low)) { finishGuided(true); return; }
-                if (/^(skip|chhodo|chodo|agla|next)$/.test(low)) { guided.idx++; setTimeout(nextGuidedField, 500); return; }
-                if (/^(submit|jama karo|save)$/.test(low)) { finishGuided(); trySubmit(); return; }
-                setFieldValue(f.el, normValue(spoken));
-                guided.idx++; setTimeout(nextGuidedField, 700);
+            var fab = document.createElement("button");
+            fab.className = "vai-fab";
+            fab.type = "button";
+            fab.title = "Voice Assistant";
+            fab.setAttribute("aria-label", "Voice Assistant");
+            fab.innerHTML = '<svg viewBox="0 0 24 24"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg>';
+
+            var panel = document.createElement("div");
+            panel.className = "vai-panel";
+            var title = document.createElement("div");
+            title.className = "vai-title";
+            title.textContent = "🎤 Voice Assistant";
+            var status = document.createElement("div");
+            status.className = "vai-status";
+            status.textContent = "Mic dabaiye aur command boliye.";
+            var transcript = document.createElement("div");
+            transcript.className = "vai-transcript";
+            var hint = document.createElement("div");
+            hint.className = "vai-hint";
+            hint.textContent = 'Jaise: "Wallet kholo", "Search Raj", "Print karo", "Save karo".';
+
+            // Typed-command fallback: test full command routing without a microphone.
+            var inputRow = document.createElement("div");
+            inputRow.className = "vai-inputrow";
+            var input = document.createElement("input");
+            input.type = "text";
+            input.className = "vai-input";
+            input.setAttribute("placeholder", "Ya yahan command type karein…");
+            var send = document.createElement("button");
+            send.type = "button";
+            send.className = "vai-send";
+            send.textContent = "Go";
+            inputRow.appendChild(input);
+            inputRow.appendChild(send);
+
+            function submitTyped() {
+                var v = (input.value || "").trim();
+                if (!v) return;
+                UI.setTranscript("⌨ " + v);
+                input.value = "";
+                Router.handle(v);                 // same path voice uses
+            }
+            send.addEventListener("click", submitTyped);
+            input.addEventListener("keydown", function (e) {
+                if (e.key === "Enter" || e.keyCode === 13) { e.preventDefault(); submitTyped(); }
             });
-        }, 1400);
-    }
-    function finishGuided(cancelled) {
-        guided.active = false; fab.classList.remove("guided", "listening");
-        speak(cancelled ? (guided.lang === "en" ? "Cancelled." : "Cancel kar diya.")
-            : (guided.lang === "en" ? "Done. Review and submit." : "Ho gaya. Check karke submit kijiye."), guided.lang);
-    }
-    function trySubmit() {
-        var btn = document.querySelector('input[type=submit].btn-primary,input[type=submit],button.btn-primary,button[type=submit]');
-        if (btn) setTimeout(function () { btn.click(); }, 400);
-    }
 
-    // ======================================================================
-    //  6.  Boot
-    // ======================================================================
-    function boot() { injectUI(); showPill("Voice Assistant ready. Tap the mic."); }
-    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
-    else boot();
+            panel.appendChild(title); panel.appendChild(status);
+            panel.appendChild(transcript);
+            panel.appendChild(inputRow);
+            panel.appendChild(hint);
 
+            document.body.appendChild(panel);
+            document.body.appendChild(fab);
+
+            this.fab = fab; this.panel = panel; this.inputEl = input;
+            this.statusEl = status; this.transcriptEl = transcript;
+
+            fab.addEventListener("click", function () { Speech.toggle(); });
+        },
+        setStatus: function (txt) { if (this.statusEl) this.statusEl.textContent = txt; this.show(); },
+        setTranscript: function (txt) { if (this.transcriptEl) this.transcriptEl.textContent = txt; },
+        listening: function (on) {
+            if (!this.fab) return;
+            if (on) this.fab.classList.add("listening"); else this.fab.classList.remove("listening");
+        },
+        show: function () { if (this.panel) this.panel.classList.add("show"); this._auto(); },
+        _auto: function () {
+            var self = this;
+            clearTimeout(this._t);
+            this._t = setTimeout(function () {
+                var typing = self.inputEl && document.activeElement === self.inputEl;
+                if (self.panel && !self.fab.classList.contains("listening") && !typing) {
+                    self.panel.classList.remove("show");
+                }
+            }, 6000);
+        }
+    };
+
+    /* --------------------------------------------------------- Speech module */
+    var Speech = {
+        recog: null, active: false, micGranted: false,
+        synth: window.speechSynthesis || null,
+
+        // Friendly, actionable messages for each SpeechRecognition error code.
+        explainError: function (code) {
+            switch (code) {
+                case "not-allowed":
+                case "service-not-allowed":
+                    if (!Speech.secure()) {
+                        return "Mic block hai: site HTTP par hai. SpeechRecognition sirf HTTPS ya localhost par chalta hai. SSL lagayein ya localhost se test karein.";
+                    }
+                    return "Mic permission denied. Address bar ke 🔒 icon par click → Microphone → Allow → page reload karein.";
+                case "no-speech":
+                    return "Kuch suna nahi. Mic ke paas saaf boliye.";
+                case "audio-capture":
+                    return "Microphone nahi mila. Device connect/enable karein.";
+                case "network":
+                    return "Network error. Speech service tak nahi pahunch paaya.";
+                case "aborted":
+                    return "Mic dabaiye aur command boliye.";
+                default:
+                    return "Mic error: " + (code || "unknown");
+            }
+        },
+
+        // SpeechRecognition + getUserMedia dono ke liye secure context zaroori.
+        secure: function () {
+            if (typeof window.isSecureContext === "boolean") return window.isSecureContext;
+            var h = location.hostname;
+            return location.protocol === "https:" || h === "localhost" || h === "127.0.0.1";
+        },
+
+        // Explicitly surface the permission prompt; resolves on grant, rejects with a code.
+        ensureMic: function () {
+            if (this.micGranted) return Promise.resolve();
+            if (!this.secure()) return Promise.reject("not-allowed");
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                return Promise.resolve(); // older browser: let recognition try directly
+            }
+            var self = this;
+            return navigator.mediaDevices.getUserMedia({ audio: true }).then(function (stream) {
+                self.micGranted = true;
+                // Release the track immediately; recognition opens its own.
+                try { stream.getTracks().forEach(function (t) { t.stop(); }); } catch (x) { }
+            }).catch(function (err) {
+                var name = err && err.name ? err.name : "";
+                if (name === "NotAllowedError" || name === "SecurityError") throw "not-allowed";
+                if (name === "NotFoundError" || name === "DevicesNotFoundError") throw "audio-capture";
+                throw "not-allowed";
+            });
+        },
+
+        init: function () {
+            var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+            if (!SR) { this.recog = null; return false; }
+            var r = new SR();
+            r.lang = LANG;
+            r.interimResults = false;
+            r.maxAlternatives = 1;
+            r.continuous = false;
+            var self = this;
+            r.onstart = function () { self.active = true; UI.listening(true); UI.setStatus("Sun raha hoon…"); };
+            r.onend = function () { self.active = false; UI.listening(false); };
+            r.onerror = function (e) {
+                self.active = false; UI.listening(false);
+                UI.setStatus(self.explainError(e && e.error));
+            };
+            r.onresult = function (e) {
+                var text = (e.results[0][0].transcript || "").trim();
+                UI.setTranscript("“" + text + "”");
+                Router.handle(text);
+            };
+            this.recog = r;
+            return true;
+        },
+
+        toggle: function () {
+            if (!this.recog && !this.init()) {
+                UI.setStatus("Is browser mein speech support nahi hai. Chrome/Edge use karein.");
+                return;
+            }
+            if (this.active) { try { this.recog.stop(); } catch (x) { } return; }
+
+            if (!this.secure()) {
+                UI.setStatus(this.explainError("not-allowed"));
+                return;
+            }
+
+            var self = this;
+            UI.setStatus("Mic permission check…");
+            this.ensureMic().then(function () {
+                try { self.recog.lang = LANG; self.recog.start(); }
+                catch (x) { /* already started */ }
+            }).catch(function (code) {
+                UI.setStatus(self.explainError(code));
+            });
+        },
+        say: function (text) {
+            if (!text) return;
+            try {
+                if (this.synth) {
+                    this.synth.cancel();
+                    var u = new SpeechSynthesisUtterance(text);
+                    u.lang = LANG;
+                    this.synth.speak(u);
+                }
+            } catch (x) { }
+        }
+    };
+
+    /* ------------------------------------------------------------ Nav module */
+    var Nav = {
+        // Build {name, href} from the actual rendered sidebar (dynamic per company).
+        items: function () {
+            var out = [], seen = {};
+            var anchors = document.querySelectorAll(".sidebar-menu a[href], .sidebar-menu a[runat]");
+            for (var i = 0; i < anchors.length; i++) {
+                var a = anchors[i];
+                var name = (a.textContent || "").replace(/\s+/g, " ").trim();
+                var href = a.getAttribute("href") || "";
+                if (!name) continue;
+                if (!href || href === "#") continue;
+                var key = name.toLowerCase();
+                if (seen[key]) continue;
+                seen[key] = true;
+                out.push({ name: name, href: href });
+            }
+            return out;
+        },
+        names: function () {
+            return this.items().map(function (x) { return x.name; });
+        },
+        // True if target matches a sidebar menu item with decent confidence.
+        has: function (target) {
+            var list = this.items();
+            return !!Fuzzy.bestMatch(target, list, function (x) { return x.name; }, 0.5);
+        },
+        go: function (target) {
+            var list = this.items();
+            var match = Fuzzy.bestMatch(target, list, function (x) { return x.name; }, 0.5);
+            if (match) {
+                UI.setStatus("Khol raha hoon: " + match.name);
+                Speech.say(match.name + " khol raha hoon");
+                window.location.href = match.href;
+                return true;
+            }
+            // direct hardcoded fallbacks from config
+            var t = Fuzzy.norm(target);
+            if (Cfg.home && (t.indexOf("dashboard") >= 0 || t.indexOf("home") >= 0 || t.indexOf("होम") >= 0)) {
+                window.location.href = Cfg.home; return true;
+            }
+            if (Cfg.logout && (t.indexOf("logout") >= 0 || t.indexOf("log out") >= 0 || t.indexOf("लॉगआउट") >= 0)) {
+                window.location.href = Cfg.logout; return true;
+            }
+            UI.setStatus('Menu mein "' + target + '" nahi mila.');
+            Speech.say("Ye menu nahi mila");
+            return false;
+        }
+    };
+
+    /* ----------------------------------------------------------- Grid module */
+    var Grid = {
+        search: function (query) {
+            // 1) DataTables (project uses it on most report grids)
+            try {
+                if (window.jQuery && window.jQuery.fn && window.jQuery.fn.dataTable) {
+                    var $ = window.jQuery, did = false;
+                    $(".dataTable, table").each(function () {
+                        if ($.fn.dataTable.isDataTable(this)) {
+                            $(this).DataTable().search(query).draw();
+                            did = true;
+                        }
+                    });
+                    if (did) { UI.setStatus('Grid filter: "' + query + '"'); Speech.say(query + " filter kiya"); return true; }
+                }
+            } catch (x) { }
+
+            // 2) Plain table fallback: hide rows that don't contain the query
+            var tables = document.querySelectorAll("table");
+            var q = query.toLowerCase(), matched = false;
+            for (var t = 0; t < tables.length; t++) {
+                var rows = tables[t].tBodies.length ? tables[t].tBodies[0].rows : tables[t].rows;
+                for (var r = 0; r < rows.length; r++) {
+                    var show = rows[r].textContent.toLowerCase().indexOf(q) >= 0;
+                    rows[r].style.display = show ? "" : "none";
+                    if (show) matched = true;
+                }
+            }
+            UI.setStatus(matched ? ('Filter: "' + query + '"') : ('Kuch nahi mila: "' + query + '"'));
+            Speech.say(matched ? (query + " filter kiya") : "Kuch nahi mila");
+            return matched;
+        }
+    };
+
+    /* ---------------------------------------------------------- Forms module */
+    var Forms = {
+        labelFor: function (el) {
+            var txt = "";
+            if (el.id) {
+                var lbl = document.querySelector('label[for="' + el.id + '"]');
+                if (lbl) txt += " " + lbl.textContent;
+            }
+            txt += " " + (el.getAttribute("placeholder") || "");
+            txt += " " + (el.getAttribute("name") || "");
+            txt += " " + (el.id || "");
+            txt += " " + (el.getAttribute("aria-label") || "");
+            return txt;
+        },
+        fields: function () {
+            return Array.prototype.slice.call(
+                document.querySelectorAll("input:not([type=hidden]):not([type=submit]):not([type=button]), textarea, select")
+            ).filter(function (e) {
+                if (e.offsetParent === null) return false;          // visible only
+                if (e.disabled || e.readOnly) return false;          // editable only
+                return true;
+            });
+        },
+        fill: function (target, value) {
+            var list = this.fields(), self = this;
+            var match = Fuzzy.bestMatch(target, list, function (e) { return self.labelFor(e); }, 0.45);
+            if (!match) { UI.setStatus('Field "' + target + '" nahi mila.'); return false; }
+
+            var tag = match.tagName.toLowerCase();
+            var type = (match.getAttribute("type") || "").toLowerCase();
+
+            if (tag === "select") {
+                var opts = match.options, picked = -1, bestS = 0;
+                for (var i = 0; i < opts.length; i++) {
+                    var s = Fuzzy.score(value, opts[i].text);
+                    if (s > bestS) { bestS = s; picked = i; }
+                }
+                if (picked >= 0 && bestS >= 0.5) {
+                    match.selectedIndex = picked;
+                    this._fire(match, "change");
+                }
+            } else if (type === "checkbox") {
+                var on = /^(yes|true|on|haan|हाँ|check|select)/i.test(value);
+                match.checked = on; this._fire(match, "change");
+            } else if (type === "radio") {
+                var group = document.getElementsByName(match.name), bestR = null, bestRS = 0;
+                for (var j = 0; j < group.length; j++) {
+                    var s2 = Fuzzy.score(value, this.labelFor(group[j]));
+                    if (s2 > bestRS) { bestRS = s2; bestR = group[j]; }
+                }
+                if (bestR) { bestR.checked = true; this._fire(bestR, "change"); }
+            } else {
+                match.value = value;                 // textContent-safe (value, not innerHTML)
+                this._fire(match, "input"); this._fire(match, "change");
+            }
+            try { match.focus(); } catch (x) { }
+            UI.setStatus("Bhar diya: " + value);
+            Speech.say("Bhar diya");
+            return true;
+        },
+        _fire: function (el, type) {
+            var ev;
+            try { ev = new Event(type, { bubbles: true }); }
+            catch (x) { ev = document.createEvent("Event"); ev.initEvent(type, true, true); }
+            el.dispatchEvent(ev);
+        }
+    };
+
+    /* -------------------------------------------------------- Buttons module */
+    var Buttons = {
+        synonyms: {
+            save: ["save", "सेव", "सहेज", "जमा"],
+            search: ["search", "खोज", "ढूंढ", "find"],
+            reset: ["reset", "रीसेट", "साफ", "clear"],
+            cancel: ["cancel", "रद्द", "कैंसिल"],
+            update: ["update", "अपडेट"],
+            "delete": ["delete", "डिलीट", "हटा", "remove"],
+            approve: ["approve", "अप्रूव", "स्वीकार", "मंजूर"],
+            reject: ["reject", "रिजेक्ट", "अस्वीकार"],
+            print: ["print", "प्रिंट", "छाप"],
+            "export": ["export", "excel", "pdf", "डाउनलोड"],
+            submit: ["submit", "generate", "invoice", "बनाओ"]
+        },
+        clickables: function () {
+            return Array.prototype.slice.call(
+                document.querySelectorAll(
+                    "button, input[type=submit], input[type=button], a.btn, a[onclick], .btn"
+                )
+            ).filter(function (e) { return e.offsetParent !== null; });
+        },
+        textOf: function (el) {
+            return ((el.value || "") + " " + (el.textContent || "") + " " +
+                (el.title || "") + " " + (el.id || "")).trim();
+        },
+        click: function (target) {
+            var keyset = null, t = Fuzzy.norm(target);
+            for (var key in this.synonyms) {
+                if (!this.synonyms.hasOwnProperty(key)) continue;
+                var arr = this.synonyms[key];
+                for (var k = 0; k < arr.length; k++) {
+                    if (t.indexOf(Fuzzy.norm(arr[k])) >= 0 || Fuzzy.norm(arr[k]).indexOf(t) >= 0) {
+                        keyset = [key].concat(arr); break;
+                    }
+                }
+                if (keyset) break;
+            }
+            var searchTerms = keyset || [target];
+            var list = this.clickables(), best = null, bestScore = 0, self = this;
+            for (var i = 0; i < list.length; i++) {
+                var label = this.textOf(list[i]);
+                for (var s = 0; s < searchTerms.length; s++) {
+                    var sc = Fuzzy.score(searchTerms[s], label);
+                    if (sc > bestScore) { bestScore = sc; best = list[i]; }
+                }
+            }
+            if (best && bestScore >= 0.5) {
+                UI.setStatus("Click: " + (self.textOf(best).trim().substring(0, 24)));
+                Speech.say(target + " kar raha hoon");
+                best.click();
+                return true;
+            }
+            UI.setStatus('Button "' + target + '" nahi mila.');
+            return false;
+        }
+    };
+
+    /* ---------------------------------------------------------- Intent module */
+    var Intent = {
+        // Ask the server (Mistral) to parse; returns a Promise of an intent object.
+        remote: function (text) {
+            var payload = JSON.stringify({ text: text, menu: Nav.names(), page: location.pathname.split("/").pop() });
+            return fetch(ENDPOINT, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: payload,
+                credentials: "same-origin"
+            }).then(function (r) { return r.json(); });
+        }
+    };
+
+    /* ---------------------------------------------------------- Router module */
+    var Router = {
+        // Open / navigation verbs incl. common typos (kolo, jao). Used by both
+        // the local parser and the dispatch guard.
+        navVerbs: /(kholo|kolo|khol|kkholo|open|jaao|jao|chalo|chalu|dikhao|dikha|show|go to|goto|खोलो|खोल|दिखाओ|दिखा|जाओ|पर जाओ|चलो)/i,
+
+        looksLikeNav: function (text) {
+            return this.navVerbs.test(Fuzzy.norm(text));
+        },
+        stripNavVerbs: function (text) {
+            return (text || "")
+                .replace(/(kholo|kolo|khol|kkholo|open|jaao|jao|chalo|chalu|dikhao|dikha|show|go to|goto|page|खोलो|खोल|दिखाओ|दिखा|पर जाओ|जाओ|चलो|पेज)/gi, " ")
+                .replace(/\s+/g, " ").trim();
+        },
+
+        // Parse "<field> mein <value> [likho/daalo/bharo]" style commands offline.
+        fillVerbs: "likho|likh do|likhdo|likhiye|daalo|daal do|dalo|daaliye|bharo|bhar do|bhardo|type karo|set karo|enter karo|fill karo",
+        fillFromText: function (text) {
+            // Pattern: <field> (mein|me|में) <value> [optional fill verb]
+            var re = new RegExp("^(.+?)\\s+(?:mein|me|में|may)\\s+(.+?)(?:\\s+(?:" + this.fillVerbs + "))?$", "i");
+            var m = text.match(re);
+            if (m && m[1] && m[2]) {
+                var field = m[1].trim();
+                var value = m[2].trim();
+                if (field && value) return { field: field, value: value };
+            }
+            // Pattern: <field> <value> <fill verb>   (verb mandatory, no connector)
+            var re2 = new RegExp("^(.+?)\\s+(.+)\\s+(?:" + this.fillVerbs + ")$", "i");
+            var m2 = text.match(re2);
+            if (m2 && m2[1] && m2[2]) {
+                return { field: m2[1].trim(), value: m2[2].trim() };
+            }
+            return null;
+        },
+
+        handle: function (text) {
+            if (!text) return;
+            // Local quick wins first (instant, offline) for common verbs.
+            if (this.tryLocal(text)) return;
+
+            UI.setStatus("Samajh raha hoon…");
+            Intent.remote(text).then(function (intent) {
+                Router.dispatch(intent || {}, text);
+            }).catch(function () {
+                // Even if server fails, attempt a navigation guess locally.
+                if (!Router.tryLocal(text, true)) {
+                    UI.setStatus("Samajh nahi paaya. Dobara boliye.");
+                    Speech.say("Samajh nahi paaya");
+                }
+            });
+        },
+        tryLocal: function (text, force) {
+            var t = Fuzzy.norm(text);
+
+            // 1) explicit grid search
+            var m = text.match(/(?:search|find|खोजो|खोज|ढूंढो)\s+(.+)/i);
+            if (m && m[1]) return Grid.search(m[1].trim());
+
+            // 2) offline form fill ("<field> mein <value> likho") — skip if it's
+            //    actually a navigation command (those carry an open-verb).
+            if (!this.looksLikeNav(text)) {
+                var f = this.fillFromText(text);
+                if (f && Forms.fill(f.field, f.value)) return true;
+            }
+
+            // 3) navigation verbs -> match against sidebar
+            if (this.looksLikeNav(text) || force) {
+                var cleaned = this.stripNavVerbs(text);
+                if (Nav.go(cleaned || text)) return true;
+            }
+
+            // 4) single button verbs
+            var btnWords = ["save", "search", "reset", "cancel", "update", "delete", "approve",
+                "reject", "print", "export", "submit", "सेव", "खोज", "रीसेट", "प्रिंट", "अप्रूव", "रिजेक्ट"];
+            for (var i = 0; i < btnWords.length; i++) {
+                if (t === Fuzzy.norm(btnWords[i]) || t.indexOf(Fuzzy.norm(btnWords[i])) >= 0) {
+                    if (t.split(" ").length <= 2) return Buttons.click(text);
+                }
+            }
+            return false;
+        },
+        dispatch: function (intent, original) {
+            var action = (intent.action || "none").toLowerCase();
+
+            // Guard: the LLM sometimes labels an "open <menu>" command as click
+            // or none. If the user used an open-verb and the target is a real
+            // menu item, force navigation — menu items are never buttons.
+            if (action === "click" || action === "none") {
+                var candidate = intent.target || original;
+                var stripped = Router.stripNavVerbs(original);
+                if (Router.looksLikeNav(original) && (Nav.has(candidate) || Nav.has(stripped))) {
+                    action = "navigate";
+                    intent.target = Nav.has(candidate) ? candidate : stripped;
+                }
+            }
+
+            switch (action) {
+                case "navigate":
+                    Nav.go(intent.target || original); break;
+                case "search":
+                case "filter":
+                    Grid.search(intent.query || intent.target || original); break;
+                case "fill":
+                    Forms.fill(intent.target || "", intent.value || ""); break;
+                case "click":
+                    Buttons.click(intent.target || original); break;
+                default:
+                    // last resort: try a navigation guess
+                    if (!Nav.go(intent.target || original)) {
+                        UI.setStatus(intent.say || "Samajh nahi paaya.");
+                        Speech.say(intent.say || "Samajh nahi paaya");
+                    }
+                    return;
+            }
+            if (intent.say && action !== "navigate") UI.setStatus(intent.say);
+        }
+    };
+
+    /* --------------------------------------------------------------- Bootstrap */
+    function boot() { UI.build(); }
+    if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", boot);
+    } else {
+        boot();
+    }
 })();
