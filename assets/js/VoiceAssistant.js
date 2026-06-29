@@ -89,14 +89,7 @@
                 "align-items:center;gap:6px}" +
                 ".vai-status{font-size:12px;color:#6c757d;min-height:16px}" +
                 ".vai-transcript{font-size:13px;color:#191d21;margin-top:8px;min-height:18px;word-break:break-word}" +
-                ".vai-hint{font-size:11px;color:#98a6ad;margin-top:8px;line-height:1.5}" +
-                ".vai-inputrow{display:flex;gap:6px;margin-top:10px}" +
-                ".vai-input{flex:1;min-width:0;border:1px solid #e3e6f0;border-radius:8px;padding:6px 9px;" +
-                "font-size:13px;color:#191d21;outline:none}" +
-                ".vai-input:focus{border-color:#6f42c1;box-shadow:0 0 0 2px rgba(111,66,193,.15)}" +
-                ".vai-send{border:none;border-radius:8px;padding:6px 12px;font-size:13px;font-weight:600;" +
-                "color:#fff;background:linear-gradient(135deg,#6f42c1,#4d7cfe);cursor:pointer}" +
-                ".vai-send:hover{opacity:.92}";
+                ".vai-hint{font-size:11px;color:#98a6ad;margin-top:8px;line-height:1.5}";
             document.head.appendChild(style);
 
             var fab = document.createElement("button");
@@ -120,41 +113,14 @@
             hint.className = "vai-hint";
             hint.textContent = 'Jaise: "Wallet kholo", "Search Raj", "Print karo", "Save karo".';
 
-            // Typed-command fallback: test full command routing without a microphone.
-            var inputRow = document.createElement("div");
-            inputRow.className = "vai-inputrow";
-            var input = document.createElement("input");
-            input.type = "text";
-            input.className = "vai-input";
-            input.setAttribute("placeholder", "Ya yahan command type karein…");
-            var send = document.createElement("button");
-            send.type = "button";
-            send.className = "vai-send";
-            send.textContent = "Go";
-            inputRow.appendChild(input);
-            inputRow.appendChild(send);
-
-            function submitTyped() {
-                var v = (input.value || "").trim();
-                if (!v) return;
-                UI.setTranscript("⌨ " + v);
-                input.value = "";
-                Router.handle(v);                 // same path voice uses
-            }
-            send.addEventListener("click", submitTyped);
-            input.addEventListener("keydown", function (e) {
-                if (e.key === "Enter" || e.keyCode === 13) { e.preventDefault(); submitTyped(); }
-            });
-
             panel.appendChild(title); panel.appendChild(status);
             panel.appendChild(transcript);
-            panel.appendChild(inputRow);
             panel.appendChild(hint);
 
             document.body.appendChild(panel);
             document.body.appendChild(fab);
 
-            this.fab = fab; this.panel = panel; this.inputEl = input;
+            this.fab = fab; this.panel = panel;
             this.statusEl = status; this.transcriptEl = transcript;
 
             fab.addEventListener("click", function () { Speech.toggle(); });
@@ -170,8 +136,7 @@
             var self = this;
             clearTimeout(this._t);
             this._t = setTimeout(function () {
-                var typing = self.inputEl && document.activeElement === self.inputEl;
-                if (self.panel && !self.fab.classList.contains("listening") && !typing) {
+                if (self.panel && !self.fab.classList.contains("listening")) {
                     self.panel.classList.remove("show");
                 }
             }, 6000);
@@ -376,6 +341,11 @@
 
     /* ---------------------------------------------------------- Forms module */
     var Forms = {
+        // Verbs that mean "type this in" (trailing). Hindi + English + typos.
+        FILL_VERBS: /\s*(likho|likhe|likh do|likhna|likhdo|bharo|bhar do|bhardo|daalo|dalo|daal do|type karo|type kar|type|fill karo|fill|set karo|set|enter karo|enter)\s*$/i,
+        // Connectors between field and value: "subject MEIN test".
+        CONNECTORS: /^(.*?)\s+(?:mein|me|men|par|pe|=|:|ko)\s+(.+)$/i,
+
         labelFor: function (el) {
             var txt = "";
             if (el.id) {
@@ -392,16 +362,77 @@
             return Array.prototype.slice.call(
                 document.querySelectorAll("input:not([type=hidden]):not([type=submit]):not([type=button]), textarea, select")
             ).filter(function (e) {
-                if (e.offsetParent === null) return false;          // visible only
-                if (e.disabled || e.readOnly) return false;          // editable only
+                if (e.closest && e.closest(".vai-panel")) return false; // skip our own command box
+                if (e.offsetParent === null) return false;              // visible only
+                if (e.disabled || e.readOnly) return false;             // editable only
                 return true;
             });
         },
+
+        // {el, score} of the field whose label best matches `text`.
+        _bestField: function (text, fields) {
+            var best = null, bestScore = 0, self = this;
+            for (var i = 0; i < fields.length; i++) {
+                var s = Fuzzy.score(text, self.labelFor(fields[i]));
+                if (s > bestScore) { bestScore = s; best = fields[i]; }
+            }
+            return { el: best, score: bestScore };
+        },
+
+        // Parse "<field> mein <value> likho" OR "<field> <value>" -> {el, value}.
+        parseFill: function (text) {
+            var raw = (text || "").trim();
+            if (!raw) return null;
+            var fields = this.fields();
+            if (!fields.length) return null;
+
+            var hadVerb = this.FILL_VERBS.test(raw);
+            var s = raw.replace(this.FILL_VERBS, "").trim();
+            if (!s) return null;
+
+            // 1) explicit connector form
+            var conn = s.match(this.CONNECTORS);
+            if (conn) {
+                var f = this._bestField(conn[1].trim(), fields);
+                if (f.el && f.score >= 0.5) return { el: f.el, value: conn[2].trim() };
+            }
+
+            // 2) progressive split: first k words = field, remaining = value
+            var words = s.split(/\s+/);
+            if (words.length >= 2) {
+                var bestEl = null, bestScore = 0, bestVal = "";
+                for (var k = 1; k < words.length; k++) {
+                    var cand = words.slice(0, k).join(" ");
+                    var m = this._bestField(cand, fields);
+                    // prefer matches that consume more field words at equal score
+                    if (m.score > bestScore || (m.score === bestScore && k < (bestVal ? 99 : 0))) {
+                        bestScore = m.score; bestEl = m.el; bestVal = words.slice(k).join(" ");
+                    }
+                }
+                // Require a strong field match (loosen a bit when a fill-verb was present).
+                var threshold = hadVerb ? 0.55 : 0.62;
+                if (bestEl && bestScore >= threshold && bestVal) return { el: bestEl, value: bestVal };
+            }
+            return null;
+        },
+
+        // Offline entry point used by the Router before hitting the server.
+        fillByText: function (text) {
+            var p = this.parseFill(text);
+            if (!p) return false;
+            return this._apply(p.el, p.value);
+        },
+
+        // Mistral path: explicit field + value already extracted.
         fill: function (target, value) {
             var list = this.fields(), self = this;
             var match = Fuzzy.bestMatch(target, list, function (e) { return self.labelFor(e); }, 0.45);
             if (!match) { UI.setStatus('Field "' + target + '" nahi mila.'); return false; }
+            return this._apply(match, value);
+        },
 
+        // Set a value on any control type. textContent/value-safe (no innerHTML).
+        _apply: function (match, value) {
             var tag = match.tagName.toLowerCase();
             var type = (match.getAttribute("type") || "").toLowerCase();
 
@@ -411,12 +442,9 @@
                     var s = Fuzzy.score(value, opts[i].text);
                     if (s > bestS) { bestS = s; picked = i; }
                 }
-                if (picked >= 0 && bestS >= 0.5) {
-                    match.selectedIndex = picked;
-                    this._fire(match, "change");
-                }
+                if (picked >= 0 && bestS >= 0.5) { match.selectedIndex = picked; this._fire(match, "change"); }
             } else if (type === "checkbox") {
-                var on = /^(yes|true|on|haan|हाँ|check|select)/i.test(value);
+                var on = /^(yes|true|on|haan|हाँ|check|select|tick)/i.test(value);
                 match.checked = on; this._fire(match, "change");
             } else if (type === "radio") {
                 var group = document.getElementsByName(match.name), bestR = null, bestRS = 0;
@@ -426,14 +454,16 @@
                 }
                 if (bestR) { bestR.checked = true; this._fire(bestR, "change"); }
             } else {
-                match.value = value;                 // textContent-safe (value, not innerHTML)
+                match.value = value;                 // value, not innerHTML -> XSS-safe
                 this._fire(match, "input"); this._fire(match, "change");
             }
             try { match.focus(); } catch (x) { }
-            UI.setStatus("Bhar diya: " + value);
+            var label = (this.labelFor(match) || "").trim().split(/\s+/)[0] || "field";
+            UI.setStatus("Bhar diya — " + label + ": " + value);
             Speech.say("Bhar diya");
             return true;
         },
+
         _fire: function (el, type) {
             var ev;
             try { ev = new Event(type, { bubbles: true }); }
@@ -462,7 +492,10 @@
                 document.querySelectorAll(
                     "button, input[type=submit], input[type=button], a.btn, a[onclick], .btn"
                 )
-            ).filter(function (e) { return e.offsetParent !== null; });
+            ).filter(function (e) {
+                if (e.closest && e.closest(".vai-panel")) return false; // skip our own buttons
+                return e.offsetParent !== null;
+            });
         },
         textOf: function (el) {
             return ((el.value || "") + " " + (el.textContent || "") + " " +
@@ -497,6 +530,28 @@
             }
             UI.setStatus('Button "' + target + '" nahi mila.');
             return false;
+        },
+
+        // Offline detector for short button commands like "Submit karo",
+        // "Save", "Print karo". Uses the synonym table (covers submit too).
+        tryByText: function (text) {
+            var t = Fuzzy.norm(text);
+            // strip trailing helper verbs: karo / kar / do / kardo / karna
+            var core = t.replace(/\s*(kardo|kar do|karna|karo|kar|kijiye|do)\s*$/i, "").trim();
+            if (!core) return false;
+            if (core.split(" ").length > 3) return false;   // keep button commands short
+            for (var key in this.synonyms) {
+                if (!this.synonyms.hasOwnProperty(key)) continue;
+                var arr = this.synonyms[key];
+                for (var i = 0; i < arr.length; i++) {
+                    var syn = Fuzzy.norm(arr[i]);
+                    if (!syn) continue;
+                    if (core === syn || core.indexOf(syn) >= 0 || syn.indexOf(core) >= 0) {
+                        return this.click(key);
+                    }
+                }
+            }
+            return false;
         }
     };
 
@@ -529,26 +584,6 @@
                 .replace(/\s+/g, " ").trim();
         },
 
-        // Parse "<field> mein <value> [likho/daalo/bharo]" style commands offline.
-        fillVerbs: "likho|likh do|likhdo|likhiye|daalo|daal do|dalo|daaliye|bharo|bhar do|bhardo|type karo|set karo|enter karo|fill karo",
-        fillFromText: function (text) {
-            // Pattern: <field> (mein|me|में) <value> [optional fill verb]
-            var re = new RegExp("^(.+?)\\s+(?:mein|me|में|may)\\s+(.+?)(?:\\s+(?:" + this.fillVerbs + "))?$", "i");
-            var m = text.match(re);
-            if (m && m[1] && m[2]) {
-                var field = m[1].trim();
-                var value = m[2].trim();
-                if (field && value) return { field: field, value: value };
-            }
-            // Pattern: <field> <value> <fill verb>   (verb mandatory, no connector)
-            var re2 = new RegExp("^(.+?)\\s+(.+)\\s+(?:" + this.fillVerbs + ")$", "i");
-            var m2 = text.match(re2);
-            if (m2 && m2[1] && m2[2]) {
-                return { field: m2[1].trim(), value: m2[2].trim() };
-            }
-            return null;
-        },
-
         handle: function (text) {
             if (!text) return;
             // Local quick wins first (instant, offline) for common verbs.
@@ -566,33 +601,23 @@
             });
         },
         tryLocal: function (text, force) {
-            var t = Fuzzy.norm(text);
-
-            // 1) explicit grid search
+            // 1) explicit grid search: "search X" / "khojo X"
             var m = text.match(/(?:search|find|खोजो|खोज|ढूंढो)\s+(.+)/i);
             if (m && m[1]) return Grid.search(m[1].trim());
 
-            // 2) offline form fill ("<field> mein <value> likho") — skip if it's
-            //    actually a navigation command (those carry an open-verb).
-            if (!this.looksLikeNav(text)) {
-                var f = this.fillFromText(text);
-                if (f && Forms.fill(f.field, f.value)) return true;
-            }
-
-            // 3) navigation verbs -> match against sidebar
+            // 2) navigation: open-verb -> sidebar menu (highest-priority verb)
             if (this.looksLikeNav(text) || force) {
                 var cleaned = this.stripNavVerbs(text);
                 if (Nav.go(cleaned || text)) return true;
             }
 
-            // 4) single button verbs
-            var btnWords = ["save", "search", "reset", "cancel", "update", "delete", "approve",
-                "reject", "print", "export", "submit", "सेव", "खोज", "रीसेट", "प्रिंट", "अप्रूव", "रिजेक्ट"];
-            for (var i = 0; i < btnWords.length; i++) {
-                if (t === Fuzzy.norm(btnWords[i]) || t.indexOf(Fuzzy.norm(btnWords[i])) >= 0) {
-                    if (t.split(" ").length <= 2) return Buttons.click(text);
-                }
-            }
+            // 3) offline form fill: "<field> mein <value> likho" OR bare "<field> <value>"
+            //    (e.g. "subject test" -> Subject field = "test")
+            if (Forms.fillByText(text)) return true;
+
+            // 4) short button commands: "Submit karo", "Save", "Print karo"...
+            if (Buttons.tryByText(text)) return true;
+
             return false;
         },
         dispatch: function (intent, original) {
